@@ -14,6 +14,17 @@ let isInitializingSession = false;
 let systemAudioProc = null;
 let messageBuffer = '';
 
+// Session management variables
+let sessionRetryCount = 0;
+const MAX_RETRY_ATTEMPTS = 3;
+let isSessionClosing = false;
+let connectionHealthTimer = null;
+
+// Token monitoring
+let totalTokensUsed = 0;
+const TOKEN_LIMIT_WARNING = 15000;
+const TOKEN_LIMIT_RESTART = 18000;
+
 function sendToRenderer(channel, data) {
     const windows = BrowserWindow.getAllWindows();
     if (windows.length > 0) {
@@ -26,6 +37,7 @@ function initializeNewSession() {
     currentSessionId = Date.now().toString();
     currentTranscription = '';
     conversationHistory = [];
+    totalTokensUsed = 0; // Reset token counter
     console.log('New conversation session started:', currentSessionId);
 }
 
@@ -108,13 +120,14 @@ async function getStoredSetting(key, defaultValue) {
     return defaultValue;
 }
 
-async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US') {
+async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'interview', language = 'en-US', geminiSessionRef = null) {
     if (isInitializingSession) {
         console.log('Session initialization already in progress');
         return false;
     }
 
     isInitializingSession = true;
+    isSessionClosing = false;
     sendToRenderer('session-initializing', true);
 
     const client = new GoogleGenAI({
@@ -135,10 +148,17 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         const session = await client.live.connect({
             model: 'gemini-live-2.5-flash-preview',
             callbacks: {
-                onopen: function () {
+                onopen: () => {
+                    console.log('Gemini session opened successfully');
+                    sessionRetryCount = 0; // Reset retry count on successful connection
                     sendToRenderer('update-status', 'Connected to Gemini - Starting recording...');
+                    
+                    // Start connection health monitoring
+                    if (geminiSessionRef) {
+                        startConnectionHealthMonitoring(geminiSessionRef);
+                    }
                 },
-                onmessage: function (message) {
+                onmessage: (message) => {
                     console.log('----------------', message);
 
                     // Handle transcription input
@@ -171,21 +191,67 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
                     if (message.serverContent?.turnComplete) {
                         sendToRenderer('update-status', 'Listening...');
                     }
+
+                    // Log usage metadata for monitoring
+                    if (message.usageMetadata) {
+                        console.log('Token usage:', message.usageMetadata);
+                        totalTokensUsed = message.usageMetadata.totalTokenCount || 0;
+                        
+                        // Check for high token usage and warn
+                        if (totalTokensUsed > TOKEN_LIMIT_WARNING) {
+                            console.warn('⚠️ High token usage detected:', totalTokensUsed);
+                            sendToRenderer('update-status', `High token usage (${totalTokensUsed}) - consider restarting session`);
+                        }
+                        
+                        // Auto-restart session if approaching limits
+                        if (totalTokensUsed > TOKEN_LIMIT_RESTART) {
+                            console.warn('🔄 Token limit approaching, restarting session automatically');
+                            sendToRenderer('update-status', 'Restarting session due to token limit...');
+                            
+                            // Schedule restart after a brief delay
+                            // Note: We need to get the geminiSessionRef from the calling context
+                            setTimeout(async () => {
+                                // This will be handled by the IPC handler which has access to geminiSessionRef
+                                sendToRenderer('auto-restart-session', { apiKey, customPrompt, profile, language });
+                            }, 1000);
+                        }
+                    }
                 },
-                onerror: function (e) {
-                    console.debug('Error:', e.message);
+                onerror: (e) => {
+                    console.error('Gemini session error:', e);
                     sendToRenderer('update-status', 'Error: ' + e.message);
+                    
+                    // Attempt to recover from certain types of errors
+                    if (!isSessionClosing && shouldRetryConnection(e)) {
+                        handleConnectionError(apiKey, customPrompt, profile, language, geminiSessionRef);
+                    }
                 },
-                onclose: function (e) {
-                    console.debug('Session closed:', e.reason);
-                    sendToRenderer('update-status', 'Session closed');
+                onclose: (e) => {
+                    console.log('Session closed:', e.reason);
+                    stopConnectionHealthMonitoring();
+                    
+                    if (!isSessionClosing) {
+                        sendToRenderer('update-status', 'Session closed unexpectedly');
+                        
+                        // Attempt to reconnect if not intentionally closed
+                        if (shouldRetryConnection(e)) {
+                            handleConnectionError(apiKey, customPrompt, profile, language, geminiSessionRef);
+                        }
+                    } else {
+                        sendToRenderer('update-status', 'Session closed');
+                    }
                 },
             },
             config: {
                 responseModalities: ['TEXT'],
                 tools: enabledTools,
                 inputAudioTranscription: {},
-                contextWindowCompression: { slidingWindow: {} },
+                contextWindowCompression: { 
+                    slidingWindow: {
+                        // Reduce context window to prevent token overflow
+                        maxTokens: 10000
+                    } 
+                },
                 speechConfig: { languageCode: language },
                 systemInstruction: {
                     parts: [{ text: systemPrompt }],
@@ -200,7 +266,79 @@ async function initializeGeminiSession(apiKey, customPrompt = '', profile = 'int
         console.error('Failed to initialize Gemini session:', error);
         isInitializingSession = false;
         sendToRenderer('session-initializing', false);
+        
+        // Attempt retry for certain errors
+        if (!isSessionClosing && shouldRetryConnection(error)) {
+            return handleConnectionError(apiKey, customPrompt, profile, language, geminiSessionRef);
+        }
+        
         return null;
+    }
+}
+
+function shouldRetryConnection(error) {
+    if (sessionRetryCount >= MAX_RETRY_ATTEMPTS) {
+        console.log('Max retry attempts reached, not retrying');
+        return false;
+    }
+    
+    // Retry for network errors, cancellation, or timeout issues
+    const retryableErrors = [
+        'CANCELLED',
+        'UNAVAILABLE', 
+        'DEADLINE_EXCEEDED',
+        'INTERNAL',
+        'network',
+        'timeout',
+        'connection'
+    ];
+    
+    const errorMessage = error?.message || error?.reason || String(error);
+    return retryableErrors.some(pattern => 
+        errorMessage.toLowerCase().includes(pattern.toLowerCase())
+    );
+}
+
+async function handleConnectionError(apiKey, customPrompt, profile, language, geminiSessionRef = null) {
+    sessionRetryCount++;
+    const delay = Math.min(1000 * (2 ** (sessionRetryCount - 1)), 10000); // Exponential backoff, max 10s
+    
+    console.log(`Attempting to reconnect in ${delay}ms (attempt ${sessionRetryCount}/${MAX_RETRY_ATTEMPTS})`);
+    sendToRenderer('update-status', `Reconnecting... (${sessionRetryCount}/${MAX_RETRY_ATTEMPTS})`);
+    
+    setTimeout(async () => {
+        console.log('Retrying Gemini session initialization...');
+        const session = await initializeGeminiSession(apiKey, customPrompt, profile, language, geminiSessionRef);
+        if (session && geminiSessionRef) {
+            geminiSessionRef.current = session;
+        }
+    }, delay);
+}
+
+function startConnectionHealthMonitoring(geminiSessionRef) {
+    // Clear any existing timer
+    stopConnectionHealthMonitoring();
+    
+    // Check connection health every 30 seconds
+    connectionHealthTimer = setInterval(() => {
+        // Send a small keep-alive message to check connection
+        if (geminiSessionRef?.current && !isSessionClosing) {
+            try {
+                // Send empty text to test connection
+                geminiSessionRef.current.sendRealtimeInput({ text: '' }).catch(error => {
+                    console.warn('Connection health check failed:', error);
+                });
+            } catch (error) {
+                console.warn('Connection health check error:', error);
+            }
+        }
+    }, 30000);
+}
+
+function stopConnectionHealthMonitoring() {
+    if (connectionHealthTimer) {
+        clearInterval(connectionHealthTimer);
+        connectionHealthTimer = null;
     }
 }
 
@@ -335,7 +473,7 @@ function stopMacOSAudioCapture() {
 }
 
 async function sendAudioToGemini(base64Data, geminiSessionRef) {
-    if (!geminiSessionRef.current) return;
+    if (!geminiSessionRef.current || isSessionClosing) return;
 
     try {
         process.stdout.write('.');
@@ -347,12 +485,17 @@ async function sendAudioToGemini(base64Data, geminiSessionRef) {
         });
     } catch (error) {
         console.error('Error sending audio to Gemini:', error);
+        
+        // If session is broken, stop sending audio
+        if (error.message.includes('CANCELLED') || error.message.includes('closed')) {
+            console.warn('Session appears to be closed, stopping audio transmission');
+        }
     }
 }
 
 function setupGeminiIpcHandlers(geminiSessionRef) {
     ipcMain.handle('initialize-gemini', async (event, apiKey, customPrompt, profile = 'interview', language = 'en-US') => {
-        const session = await initializeGeminiSession(apiKey, customPrompt, profile, language);
+        const session = await initializeGeminiSession(apiKey, customPrompt, profile, language, geminiSessionRef);
         if (session) {
             geminiSessionRef.current = session;
             return true;
@@ -375,7 +518,7 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
     });
 
     ipcMain.handle('send-image-content', async (event, { data, debug }) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
+        if (!geminiSessionRef.current || isSessionClosing) return { success: false, error: 'No active Gemini session' };
 
         try {
             if (!data || typeof data !== 'string') {
@@ -398,12 +541,25 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return { success: true };
         } catch (error) {
             console.error('Error sending image:', error);
+            
+            // Handle session-related errors
+            if (error.message.includes('CANCELLED') || error.message.includes('closed')) {
+                console.warn('Session appears to be closed during image send');
+                return { success: false, error: 'Session closed' };
+            }
+            
+            // Handle rate limiting
+            if (error.message.includes('RESOURCE_EXHAUSTED') || error.message.includes('rate')) {
+                console.warn('Rate limit hit during image send');
+                return { success: false, error: 'Rate limit exceeded - try reducing image frequency' };
+            }
+            
             return { success: false, error: error.message };
         }
     });
 
     ipcMain.handle('send-text-message', async (event, text) => {
-        if (!geminiSessionRef.current) return { success: false, error: 'No active Gemini session' };
+        if (!geminiSessionRef.current || isSessionClosing) return { success: false, error: 'No active Gemini session' };
 
         try {
             if (!text || typeof text !== 'string' || text.trim().length === 0) {
@@ -415,6 +571,13 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return { success: true };
         } catch (error) {
             console.error('Error sending text:', error);
+            
+            // Handle session-related errors  
+            if (error.message.includes('CANCELLED') || error.message.includes('closed')) {
+                console.warn('Session appears to be closed during text send');
+                return { success: false, error: 'Session closed' };
+            }
+            
             return { success: false, error: error.message };
         }
     });
@@ -448,17 +611,29 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
 
     ipcMain.handle('close-session', async event => {
         try {
+            isSessionClosing = true;
+            stopConnectionHealthMonitoring();
             stopMacOSAudioCapture();
 
             // Cleanup any pending resources and stop audio/video capture
             if (geminiSessionRef.current) {
-                await geminiSessionRef.current.close();
-                geminiSessionRef.current = null;
+                try {
+                    await geminiSessionRef.current.close();
+                } catch (closeError) {
+                    console.warn('Error during session close (this is usually safe to ignore):', closeError.message);
+                } finally {
+                    geminiSessionRef.current = null;
+                }
             }
+
+            // Reset session state
+            sessionRetryCount = 0;
+            isSessionClosing = false;
 
             return { success: true };
         } catch (error) {
             console.error('Error closing session:', error);
+            isSessionClosing = false;
             return { success: false, error: error.message };
         }
     });
@@ -494,6 +669,53 @@ function setupGeminiIpcHandlers(geminiSessionRef) {
             return { success: false, error: error.message };
         }
     });
+
+    ipcMain.handle('restart-session-due-to-tokens', async (event, { apiKey, customPrompt, profile, language }) => {
+        try {
+            const session = await restartSessionDueToTokens(apiKey, customPrompt, profile, language, geminiSessionRef);
+            return { success: !!session };
+        } catch (error) {
+            console.error('Error restarting session due to tokens:', error);
+            return { success: false, error: error.message };
+        }
+    });
+}
+
+async function restartSessionDueToTokens(apiKey, customPrompt, profile, language, geminiSessionRef) {
+    try {
+        console.log('Restarting session due to token limit...');
+        
+        // Close current session gracefully
+        if (geminiSessionRef.current) {
+            try {
+                await geminiSessionRef.current.close();
+            } catch (closeError) {
+                console.warn('Error closing session for restart:', closeError.message);
+            }
+            geminiSessionRef.current = null;
+        }
+        
+        // Reset token counter
+        totalTokensUsed = 0;
+        
+        // Start new session
+        const session = await initializeGeminiSession(apiKey, customPrompt, profile, language, geminiSessionRef);
+        if (session) {
+            // Update the session reference
+            geminiSessionRef.current = session;
+            sendToRenderer('session-restarted', { reason: 'token-limit' });
+            console.log('✅ Session restarted successfully due to token limit');
+        } else {
+            console.error('❌ Failed to restart session due to token limit');
+            sendToRenderer('update-status', 'Failed to restart session - please restart manually');
+        }
+        
+        return session;
+    } catch (error) {
+        console.error('Error restarting session due to token limit:', error);
+        sendToRenderer('update-status', 'Error restarting session - please restart manually');
+        return null;
+    }
 }
 
 module.exports = {
@@ -510,4 +732,7 @@ module.exports = {
     stopMacOSAudioCapture,
     sendAudioToGemini,
     setupGeminiIpcHandlers,
+    restartSessionDueToTokens,
+    shouldRetryConnection,
+    handleConnectionError,
 };

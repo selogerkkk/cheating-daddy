@@ -159,6 +159,12 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.on('click-through-toggled', (_, isEnabled) => {
                 this._isClickThrough = isEnabled;
             });
+            ipcRenderer.on('session-restarted', (_, data) => {
+                this.handleSessionRestart(data);
+            });
+            ipcRenderer.on('auto-restart-session', async (_, data) => {
+                await this.handleAutoRestart(data);
+            });
         }
     }
 
@@ -169,6 +175,8 @@ export class CheatingDaddyApp extends LitElement {
             ipcRenderer.removeAllListeners('update-response');
             ipcRenderer.removeAllListeners('update-status');
             ipcRenderer.removeAllListeners('click-through-toggled');
+            ipcRenderer.removeAllListeners('session-restarted');
+            ipcRenderer.removeAllListeners('auto-restart-session');
         }
     }
 
@@ -307,7 +315,7 @@ export class CheatingDaddyApp extends LitElement {
 
             if (!result.success) {
                 console.error('Failed to send message:', result.error);
-                this.setStatus('Error sending message: ' + result.error);
+                this.setStatus(`Error sending message: ${result.error}`);
             } else {
                 this.setStatus('Message sent...');
             }
@@ -321,6 +329,30 @@ export class CheatingDaddyApp extends LitElement {
     // Onboarding event handlers
     handleOnboardingComplete() {
         this.currentView = 'main';
+    }
+
+    handleSessionRestart(data) {
+        console.log('Session restarted:', data);
+        if (data.reason === 'token-limit') {
+            this.setStatus('Session restarted due to token limit');
+            // Clear responses to start fresh
+            this.responses = [];
+            this.currentResponseIndex = -1;
+            this.requestUpdate();
+        }
+    }
+
+    async handleAutoRestart(data) {
+        console.log('Auto-restarting session:', data);
+        if (window.require) {
+            const { ipcRenderer } = window.require('electron');
+            const result = await ipcRenderer.invoke('restart-session-due-to-tokens', data);
+            if (result.success) {
+                console.log('Session auto-restart successful');
+            } else {
+                console.error('Session auto-restart failed:', result.error);
+            }
+        }
     }
 
     updated(changedProperties) {
